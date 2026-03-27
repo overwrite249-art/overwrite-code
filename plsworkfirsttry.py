@@ -3,12 +3,6 @@
 ╔══════════════════════════════════════════════════════════════╗
 ║           OVERWRITE CODE  —  AI Folder Agent CLI            ║
 ╚══════════════════════════════════════════════════════════════╝
-
-Requirements:
-    pip install requests rich
-
-Usage:
-    python overwrite_code.py
 """
 
 from __future__ import annotations
@@ -26,7 +20,6 @@ try:
     from rich.console import Console
     from rich.panel import Panel
     from rich.prompt import Prompt
-    from rich.table import Table
     from rich.rule import Rule
     from rich.markup import escape
     import requests
@@ -38,57 +31,65 @@ except ImportError:
 
 console = Console()
 
-AVAILABLE_MODELS: Dict[str, str] = {
-    "claude-opus-4-6": "claude-opus-4-6",
-}
-
-DEFAULT_MODEL = "claude-opus-4-6"
-
-async def lm_chat_stream(model_name: str, messages: List[Dict], proxy=None, timeout=0):
-    url = "https://overwrite-code-backend.onrender.com/api/chat"
-    prompt_text = ""
-    for m in messages:
-        role = m.get("role", "user").upper()
-        content = m.get("content", "")
-        if isinstance(content, list):
-            content = " ".join(x.get("text", "") for x in content if isinstance(x, dict) and x.get("type") == "text")
-        prompt_text += f"[{role}]\n{content}\n\n"
-        
-    payload = {
-        "prompt": prompt_text.strip(),
-        "max_tokens": 150000
-    }
+# =====================================================================
+# 1. NEW PROXY BACKEND CONNECTION
+# =====================================================================
+async def lm_chat_stream(messages: List[Dict], timeout=0):
+    """Connects to your Anthropic-compatible Render proxy using SSE Streaming."""
+    url = "https://claude-oppusy.onrender.com/v1/messages"
     
+    # Format messages for Anthropic API
+    system_text = ""
+    anthropic_msgs = []
+    
+    for m in messages:
+        if m["role"] == "system":
+            system_text += m["content"] + "\n\n"
+        else:
+            anthropic_msgs.append({"role": m["role"], "content": m["content"]})
+            
+    payload = {
+        "model": "claude-3-7-sonnet-20250219", # Proxy will intercept and route to Opus 4.6
+        "messages": anthropic_msgs,
+        "system": system_text.strip(),
+        "stream": True
+    }
+        
     try:
-        response = await asyncio.to_thread(requests.post, url, json=payload, stream=True)
+        response = await asyncio.to_thread(
+            requests.post, 
+            url, 
+            json=payload, 
+            stream=True
+        )
+        
         if response.status_code != 200:
             yield ("error", f"HTTP {response.status_code}: {response.text}")
             return
             
-        for line in response.iter_lines():
-            if not line:
-                continue
-            line = line.decode('utf-8')
-            if line.startswith('data: '):
+        # Parse Server-Sent Events (SSE)
+        for line in response.iter_lines(decode_unicode=True):
+            if line and line.startswith("data: "):
                 data_str = line[6:]
-                if data_str.strip() == '[DONE]':
-                    yield ("done", None)
+                if data_str.strip() == "[DONE]":
                     break
                 try:
-                    data = json.loads(data_str)
-                    if data.get("type") == "content_block_delta":
-                        delta = data.get("delta", {})
-                        if delta.get("type") == "text_delta":
-                            yield ("text", delta.get("text", ""))
-                    elif data.get("type") == "error":
-                        yield ("error", data.get("error", "Unknown error"))
-                        break
-                except Exception:
+                    event = json.loads(data_str)
+                    if event.get("type") == "content_block_delta":
+                        text = event["delta"].get("text", "")
+                        if text:
+                            yield ("text", text)
+                except json.JSONDecodeError:
                     pass
+                    
         yield ("done", None)
     except Exception as e:
         yield ("error", str(e))
 
+
+# =====================================================================
+# 2. FILE SYSTEM TOOLS
+# =====================================================================
 def list_folder(path: str, max_depth: int = 3, _depth: int = 0) -> str:
     p = Path(path)
     if not p.exists(): return f"[Path does not exist: {path}]"
@@ -210,6 +211,10 @@ def execute_action(action: Dict, folder_path: str) -> str:
         return delete_item(path)
     return ""
 
+
+# =====================================================================
+# 3. UI AND CHAT LOOP
+# =====================================================================
 BANNER_LINES =[
     "  ██████╗ ██╗   ██╗███████╗██████╗ ██╗    ██╗██████╗ ██╗████████╗███████╗",
     "  ██╔══██╗██║   ██║██╔════╝██╔══██╗██║    ██║██╔══██╗██║╚══██╔══╝██╔════╝",
@@ -223,93 +228,48 @@ BANNER_LINES =[
     "  ██║     ██║   ██║██║  ██║█████╗  ",
     "  ██║     ██║   ██║██║  ██║██╔══╝  ",
     "  ╚██████╗╚██████╔╝██████╔╝███████╗",
-    "   ╚═════╝ ╚═════╝ ╚═════╝ ╚══════╝",
-    "(150k token limit per msg btw)"
+    "   ╚═════╝ ╚═════╝ ╚═════╝ ╚══════╝"
 ]
 
 def print_banner():
     console.print()
     for i, line in enumerate(BANNER_LINES):
         if i < 6:
-            colors =["bold red", "bold red", "bold bright_red", "bold red", "bold bright_red", "bold red"]
-            col = colors[i % len(colors)]
+            col = "bold red" if i % 2 == 0 else "bold bright_red"
         else:
-            colors2 =["bold yellow", "bold bright_yellow", "bold yellow", "bold bright_yellow", "bold yellow", "bold bright_yellow"]
-            col = colors2[(i-7) % len(colors2)]
+            col = "bold yellow" if i % 2 == 0 else "bold bright_yellow"
         console.print(f"[{col}]{line}[/{col}]")
     console.print()
-    console.print()
 
-def settings_menu(current_model: str, folder_path: str) -> tuple[str, str]:
-    console.print()
+def settings_menu(folder_path: str) -> str:
     console.print(Rule("[bold cyan]SETTINGS[/bold cyan]", style="cyan"))
-    console.print()
-
-    table = Table(title="Available Models", border_style="dim", show_lines=True)
-    table.add_column("#", style="dim", width=4)
-    table.add_column("Model", style="cyan")
-    table.add_column("", style="green")
-    model_list = list(AVAILABLE_MODELS.keys())
-    for i, m in enumerate(model_list, 1):
-        marker = "< current" if m == current_model else ""
-        table.add_row(str(i), m, marker)
-    console.print(table)
-
-    choice = Prompt.ask("\n[cyan]Enter model number or name (Enter to keep current)[/cyan]", default="").strip()
-    if choice:
-        if choice.isdigit():
-            idx = int(choice) - 1
-            if 0 <= idx < len(model_list):
-                current_model = model_list[idx]
-        elif choice in AVAILABLE_MODELS:
-            current_model = choice
-        else:
-            console.print("[yellow]Model not found, keeping current.[/yellow]")
-
     new_folder = Prompt.ask("[cyan]Folder path (Enter to keep current)[/cyan]", default="").strip()
     if new_folder and Path(new_folder).exists():
         folder_path = str(Path(new_folder).resolve())
-    elif new_folder:
-        console.print("[yellow]Path not found, keeping current.[/yellow]")
+    console.print(f"[green]OK Folder:[/green][bold]{folder_path}[/bold]\n")
+    return folder_path
 
-    console.print()
-    console.print(f"[green]OK Model:[/green] [bold]{current_model}[/bold]")
-    console.print(f"[green]OK Folder:[/green] [bold]{folder_path}[/bold]")
-    console.print(Rule(style="dim"))
-    return current_model, folder_path
-
-async def chat_loop(folder_path: str, model: str = DEFAULT_MODEL):
+async def chat_loop(folder_path: str):
     conversation_messages: List[Dict] =[]
     ai_memory = ""
 
     console.print(Rule("[bold green]Session started[/bold green]", style="green"))
-    console.print(f"[green]Model:[/green][bold cyan]{model}[/bold cyan]")
     console.print(f"[green]Folder:[/green][bold]{folder_path}[/bold]")
-    console.print()
-    console.print("[dim]Type your message. Commands:[/dim]")
-    console.print("[dim]  settings  -> change model / folder[/dim]")
-    console.print("[dim]  clear     -> clear conversation[/dim]")
-    console.print("[dim]  tree      -> show folder tree[/dim]")
-    console.print("[dim]  exit/quit -> quit[/dim]")
+    console.print("[dim]Type your message. Commands: settings, clear, tree, exit[/dim]")
     console.print(Rule(style="dim"))
-    console.print()
 
     system_prompt = "You are an expert autonomous AI file editor. You ONLY use XML tags to edit and delete files and folders."
 
     while True:
+        console.print()
         try:
             user_input = Prompt.ask("[bold bright_white]You[/bold bright_white]").strip()
         except (KeyboardInterrupt, EOFError):
-            console.print("\n[dim]Bye![/dim]")
             break
 
-        if not user_input:
-            continue
-
+        if not user_input: continue
         lw = user_input.lower()
-        if lw in ("exit", "quit", "q"):
-            console.print("\n[dim]Bye![/dim]")
-            break
+        if lw in ("exit", "quit", "q"): break
         if lw == "clear":
             conversation_messages.clear()
             ai_memory = ""
@@ -319,7 +279,7 @@ async def chat_loop(folder_path: str, model: str = DEFAULT_MODEL):
             console.print(Panel(list_folder(folder_path), title="Folder Tree", border_style="dim"))
             continue
         if lw == "settings":
-            model, folder_path = settings_menu(model, folder_path)
+            folder_path = settings_menu(folder_path)
             continue
 
         conversation_messages.append({"role": "user", "content": user_input})
@@ -344,129 +304,127 @@ CRITICAL REMINDER:
             enforcement += f"\n[MEMORY FROM PREVIOUS TURN]\n{ai_memory}\n"
 
         messages_to_send =[{"role": "system", "content": system_prompt}] + list(conversation_messages)
-        last_msg = messages_to_send[-1].copy()
-        last_msg["content"] += "\n\n" + enforcement
-        messages_to_send[-1] = last_msg
+        messages_to_send[-1]["content"] += "\n\n" + enforcement
 
-        console.print()
-        console.print(f"[bold bright_magenta]AI[/bold bright_magenta][dim]({model})[/dim]")
-            
+        console.print(f"\n[bold bright_magenta]AI[/bold bright_magenta] [dim](Opus 4.6)[/dim]")
         console.print(Rule(style="dim magenta"))
-        console.print("[dim italic]Press Ctrl+C to stop generation[/dim italic]")
 
-        response_buffer =[]
-        status_text = ""
-
-        def clear_status():
-            nonlocal status_text
-            if status_text:
-                sys.stdout.write("\r" + " " * 80 + "\r")
-                sys.stdout.flush()
-                status_text = ""
+        full_response = ""
+        
+        # State machine for the dynamic line counter UI
+        display_state = {
+            'buffer': '',
+            'in_tag': False,
+            'filename': '',
+            'lines': 0
+        }
 
         try:
-            async for kind, content in lm_chat_stream(model, messages_to_send, timeout=0):
-                if kind == "status":
-                    clear_status()
-                    sys.stdout.write(f"\r  WAIT: {content}")
-                    sys.stdout.flush()
-                    status_text = content
-                elif kind == "text":
-                    clear_status()
-                    response_buffer.append(content)
-                    print(content, end="", flush=True)
-                elif kind == "done":
-                    clear_status()
-                    print()
-                    break
+            async for kind, content in lm_chat_stream(messages_to_send, timeout=0):
+                if kind == "text":
+                    full_response += content
+                    display_state['buffer'] += content
+                    
+                    while True:
+                        if not display_state['in_tag']:
+                            # Looking for the START of a file write
+                            match = re.search(r'<(write_file|file|write)\s+path=["\']([^"\']+)["\']\s*>', display_state['buffer'], re.IGNORECASE)
+                            if match:
+                                # Print all the normal talking text before the tag
+                                sys.stdout.write(display_state['buffer'][:match.start()])
+                                sys.stdout.flush()
+                                
+                                # Switch into "Writing File" mode
+                                display_state['in_tag'] = True
+                                display_state['filename'] = match.group(2)
+                                display_state['lines'] = 0
+                                
+                                sys.stdout.write(f"\n\033[96m⚙️  Writing {display_state['filename']}...\033[0m\n")
+                                
+                                display_state['buffer'] = display_state['buffer'][match.end():]
+                            else:
+                                # No tag found. Print the text to console safely.
+                                if len(display_state['buffer']) > 20:
+                                    sys.stdout.write(display_state['buffer'][:-20])
+                                    sys.stdout.flush()
+                                    display_state['buffer'] = display_state['buffer'][-20:]
+                                break
+                        else:
+                            # We are currently HIDDEN and updating the line counter
+                            match = re.search(r'</(write_file|file|write)>', display_state['buffer'], re.IGNORECASE)
+                            if match:
+                                # Finished writing file!
+                                file_chunk = display_state['buffer'][:match.start()]
+                                display_state['lines'] += file_chunk.count('\n')
+                                
+                                sys.stdout.write(f"\r\033[K  └─> \033[92m✅ Saved {display_state['lines']} lines.\033[0m\n")
+                                sys.stdout.flush()
+                                
+                                display_state['in_tag'] = False
+                                display_state['buffer'] = display_state['buffer'][match.end():]
+                            else:
+                                # Still writing. Update the counter.
+                                if len(display_state['buffer']) > 20:
+                                    file_chunk = display_state['buffer'][:-20]
+                                    display_state['lines'] += file_chunk.count('\n')
+                                    display_state['buffer'] = display_state['buffer'][-20:]
+                                    
+                                    sys.stdout.write(f"\r\033[K  └─> ✍️  Generating... {display_state['lines']} lines")
+                                    sys.stdout.flush()
+                                break
+                                
                 elif kind == "error":
-                    clear_status()
                     console.print(f"\n[red]Error: {content}[/red]")
                     break
 
+            # Flush remaining safe buffer
+            if display_state['buffer'] and not display_state['in_tag']:
+                sys.stdout.write(display_state['buffer'])
+            elif display_state['in_tag']:
+                # Connection dropped while writing
+                sys.stdout.write(f"\r\033[K  └─> \033[93m⚠️ Interrupted at {display_state['lines']} lines.\033[0m\n")
+            sys.stdout.flush()
+            print()
+
         except KeyboardInterrupt:
-            clear_status()
-            console.print("\n[bold yellow]  Generation stopped by user! (Ctrl+C)[/bold yellow]")
-        except Exception as e:
-            clear_status()
-            console.print(f"\n[red]Stream error: {e}[/red]")
+            console.print("\n[bold yellow]Generation stopped! (Ctrl+C)[/bold yellow]")
 
         console.print(Rule(style="dim magenta"))
 
-        full_response = "".join(response_buffer)
-
+        # Save AI memory
         mem_match = re.search(r'<memory>(.*?)</memory>', full_response, re.DOTALL | re.IGNORECASE)
-        if mem_match:
-            ai_memory = mem_match.group(1).strip()
-            console.print(f"[dim]Memory saved for next turn.[/dim]")
-        else:
-            ai_memory = ""
+        ai_memory = mem_match.group(1).strip() if mem_match else ""
 
-        open_count = len(re.findall(r'<(write_file|file|write)\s+path=', full_response, re.IGNORECASE))
-        close_count = len(re.findall(r'</(write_file|file|write)>', full_response, re.IGNORECASE))
-        if open_count > close_count:
+        # Auto-close tags if interrupted
+        if len(re.findall(r'<write_file', full_response, re.IGNORECASE)) > len(re.findall(r'</write_file>', full_response, re.IGNORECASE)):
             full_response += "\n</write_file>"
-            console.print("[dim]Auto-closed interrupted file write to save partial content.[/dim]")
 
+        # Actually write the files to your computer
         actions = extract_actions(full_response)
         if actions:
-            console.print()
-            console.print(Rule("[cyan]AI Executed Actions[/cyan]", style="cyan"))
+            console.print("[dim cyan]Executing changes...[/dim cyan]")
             for action in actions:
-                console.print(f"[cyan]> {action['type']}[/cyan]", end=" ")
-                
-                if action["type"] == "write_file":
-                    path = resolve_path(folder_path, action["path"])
-                    console.print(f"[dim]{path}[/dim]")
-                    preview = action["content"][:200].replace("\n", "\n")
-                    console.print(Panel(
-                        f"[dim]{escape(preview)}{'...' if len(action['content'])>200 else ''}[/dim]",
-                        title=f"[yellow]Write: {action['path']}[/yellow]",
-                        border_style="yellow",
-                    ))
-                elif action["type"] == "delete_path":
-                    path = resolve_path(folder_path, action["path"])
-                    console.print(f"[dim]{path}[/dim]")
-                
-                execute_action(action, folder_path)
-            
-            console.print(Rule(style="dim cyan"))
+                result = execute_action(action, folder_path)
+                if result:
+                    console.print(f"  [green]✔ {result}[/green]")
+            console.print()
 
         conversation_messages.append({"role": "assistant", "content": full_response})
-        console.print()
 
 async def main():
     print_banner()
 
     while True:
         try:
-            folder_raw = Prompt.ask(
-                "[bold cyan]Enter project folder path[/bold cyan]"
-            ).strip().strip('"').strip("'")
+            folder_raw = Prompt.ask("[bold cyan]Enter project folder path[/bold cyan]").strip().strip('"').strip("'")
             folder_path = str(Path(folder_raw).expanduser().resolve())
-            if Path(folder_path).is_dir():
-                break
-            console.print(f"[red]  X Not a valid directory: {folder_path}[/red]")
+            if Path(folder_path).is_dir(): break
+            console.print(f"[red]  X Not a valid directory[/red]")
         except (KeyboardInterrupt, EOFError):
-            console.print("\n[dim]Interrupted.[/dim]")
             return
 
-    console.print(f"\n[green]OK Folder:[/green][bold]{folder_path}[/bold]")
-
-    console.print()
-    console.print(Panel(
-        list_folder(folder_path, max_depth=2),
-        title=f"[bold][DIR] {folder_path}[/bold]",
-        border_style="dim",
-        padding=(0, 1),
-    ))
-
-    console.print()
-    console.print(f"[dim]Default model:[bold]{DEFAULT_MODEL}[/bold]  (type 'settings' to change)[/dim]")
-    model = DEFAULT_MODEL
-
-    console.print()
-    await chat_loop(folder_path, model)
+    console.print(f"\n[green]OK Folder:[/green][bold]{folder_path}[/bold]\n")
+    await chat_loop(folder_path)
 
 if __name__ == "__main__":
     try:
