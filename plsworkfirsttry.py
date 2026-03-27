@@ -38,7 +38,6 @@ async def lm_chat_stream(messages: List[Dict], timeout=0):
     """Connects to your Anthropic-compatible Render proxy using SSE Streaming."""
     url = "https://claude-oppusy.onrender.com/v1/messages"
     
-    # Format messages for Anthropic API
     system_text = ""
     anthropic_msgs = []
     
@@ -49,36 +48,28 @@ async def lm_chat_stream(messages: List[Dict], timeout=0):
             anthropic_msgs.append({"role": m["role"], "content": m["content"]})
             
     payload = {
-        "model": "claude-3-7-sonnet-20250219", # Proxy will intercept and route to Opus 4.6
+        "model": "claude-3-7-sonnet-20250219", 
         "messages": anthropic_msgs,
         "system": system_text.strip(),
         "stream": True
     }
         
     try:
-        response = await asyncio.to_thread(
-            requests.post, 
-            url, 
-            json=payload, 
-            stream=True
-        )
+        response = await asyncio.to_thread(requests.post, url, json=payload, stream=True)
         
         if response.status_code != 200:
             yield ("error", f"HTTP {response.status_code}: {response.text}")
             return
             
-        # Parse Server-Sent Events (SSE)
         for line in response.iter_lines(decode_unicode=True):
             if line and line.startswith("data: "):
                 data_str = line[6:]
-                if data_str.strip() == "[DONE]":
-                    break
+                if data_str.strip() == "[DONE]": break
                 try:
                     event = json.loads(data_str)
                     if event.get("type") == "content_block_delta":
                         text = event["delta"].get("text", "")
-                        if text:
-                            yield ("text", text)
+                        if text: yield ("text", text)
                 except json.JSONDecodeError:
                     pass
                     
@@ -195,25 +186,20 @@ def execute_action(action: Dict, folder_path: str) -> str:
         content = action["content"]
         if content.startswith("\n"): content = content[1:]
         
-        if content.strip().startswith("```"):
-            lines = content.strip().split("\n")
-            if lines[0].startswith("```"): lines.pop(0)
-            if lines and lines[-1].startswith("```"): lines.pop(-1)
-            content = "\n".join(lines) + "\n"
+        # Clean stray markdown markers from continuation boundaries
+        content = re.sub(r'^```[a-zA-Z]*\n', '', content)
+        content = re.sub(r'\n```$', '', content)
             
-        result = write_file(path, content)
-        return result
+        return write_file(path, content)
     elif t == "delete_path":
         path = resolve_path(folder_path, action["path"])
         if Path(path).resolve() == Path(folder_path).resolve():
             return "[Error: Cannot delete the root workspace folder!]"
-            
         return delete_item(path)
     return ""
 
-
 # =====================================================================
-# 3. UI AND CHAT LOOP
+# 3. UI AND CHAT LOOP (WITH AUTO-CONTINUE)
 # =====================================================================
 BANNER_LINES =[
     "  ██████╗ ██╗   ██╗███████╗██████╗ ██╗    ██╗██████╗ ██╗████████╗███████╗",
@@ -234,10 +220,7 @@ BANNER_LINES =[
 def print_banner():
     console.print()
     for i, line in enumerate(BANNER_LINES):
-        if i < 6:
-            col = "bold red" if i % 2 == 0 else "bold bright_red"
-        else:
-            col = "bold yellow" if i % 2 == 0 else "bold bright_yellow"
+        col = "bold red" if i < 6 and i % 2 == 0 else "bold bright_red" if i < 6 else "bold yellow" if i % 2 == 0 else "bold bright_yellow"
         console.print(f"[{col}]{line}[/{col}]")
     console.print()
 
@@ -264,10 +247,9 @@ async def chat_loop(folder_path: str):
         console.print()
         try:
             user_input = Prompt.ask("[bold bright_white]You[/bold bright_white]").strip()
-        except (KeyboardInterrupt, EOFError):
-            break
-
+        except (KeyboardInterrupt, EOFError): break
         if not user_input: continue
+        
         lw = user_input.lower()
         if lw in ("exit", "quit", "q"): break
         if lw == "clear":
@@ -284,24 +266,20 @@ async def chat_loop(folder_path: str):
 
         conversation_messages.append({"role": "user", "content": user_input})
 
-        tree = list_folder(folder_path)
-        contents = get_all_file_contents(folder_path)
-
         enforcement = f"""[SYSTEM CONTEXT & STRICT RULES]
 CURRENT FOLDER STRUCTURE:
-{tree}
+{list_folder(folder_path)}
 
 CURRENT FILE CONTENTS:
-{contents}
+{get_all_file_contents(folder_path)}
 
 CRITICAL REMINDER: 
 1. DO NOT make a plan. DO NOT ask for confirmation. JUST EXECUTE the requested file/folder changes.
-2. Use ONLY <write_file path="...">...</write_file> or <delete path="..." />. (The delete tag works on both files AND folders).
-3. NEVER wrap XML tags in markdown (```). Do not output XML tags as examples.
-4. You can use <memory>your notes</memory> to remind yourself of what you want to change in the next response. Do NOT remember code, only ideas.
+2. Use ONLY <write_file path="...">...</write_file> or <delete path="..." />.
+3. NEVER wrap XML tags in markdown (```).
+4. You can use <memory>your notes</memory> to remind yourself of ideas.
 """
-        if ai_memory:
-            enforcement += f"\n[MEMORY FROM PREVIOUS TURN]\n{ai_memory}\n"
+        if ai_memory: enforcement += f"\n[MEMORY]\n{ai_memory}\n"
 
         messages_to_send =[{"role": "system", "content": system_prompt}] + list(conversation_messages)
         messages_to_send[-1]["content"] += "\n\n" + enforcement
@@ -309,119 +287,121 @@ CRITICAL REMINDER:
         console.print(f"\n[bold bright_magenta]AI[/bold bright_magenta] [dim](Opus 4.6)[/dim]")
         console.print(Rule(style="dim magenta"))
 
+        # STATE FOR CONTINUATION LOGIC
         full_response = ""
+        current_messages = messages_to_send.copy()
         
-        # State machine for the dynamic line counter UI
-        display_state = {
-            'buffer': '',
-            'in_tag': False,
-            'filename': '',
-            'lines': 0
-        }
+        display_state = {'buffer': '', 'in_tag': False, 'filename': '', 'lines': 0}
+        continuation_count = 0
+        max_continuations = 5
 
-        try:
-            async for kind, content in lm_chat_stream(messages_to_send, timeout=0):
-                if kind == "text":
-                    full_response += content
-                    display_state['buffer'] += content
-                    
-                    while True:
-                        if not display_state['in_tag']:
-                            # Looking for the START of a file write
-                            match = re.search(r'<(write_file|file|write)\s+path=["\']([^"\']+)["\']\s*>', display_state['buffer'], re.IGNORECASE)
-                            if match:
-                                # Print all the normal talking text before the tag
-                                sys.stdout.write(display_state['buffer'][:match.start()])
-                                sys.stdout.flush()
-                                
-                                # Switch into "Writing File" mode
-                                display_state['in_tag'] = True
-                                display_state['filename'] = match.group(2)
-                                display_state['lines'] = 0
-                                
-                                sys.stdout.write(f"\n\033[96m⚙️  Writing {display_state['filename']}...\033[0m\n")
-                                
-                                display_state['buffer'] = display_state['buffer'][match.end():]
-                            else:
-                                # No tag found. Print the text to console safely.
-                                if len(display_state['buffer']) > 20:
-                                    sys.stdout.write(display_state['buffer'][:-20])
+        # AUTO-CONTINUE LOOP
+        while continuation_count <= max_continuations:
+            chunk_response = ""
+            try:
+                async for kind, content in lm_chat_stream(current_messages, timeout=0):
+                    if kind == "text":
+                        # If AI hallucinates markdown on a continuation, strip it silently
+                        if continuation_count > 0 and len(chunk_response) < 10 and "```" in content:
+                            content = content.replace("```python", "").replace("```", "")
+                            
+                        chunk_response += content
+                        display_state['buffer'] += content
+                        
+                        while True:
+                            if not display_state['in_tag']:
+                                match = re.search(r'<(write_file|file|write)\s+path=["\']([^"\']+)["\']\s*>', display_state['buffer'], re.IGNORECASE)
+                                if match:
+                                    sys.stdout.write(display_state['buffer'][:match.start()])
                                     sys.stdout.flush()
-                                    display_state['buffer'] = display_state['buffer'][-20:]
-                                break
-                        else:
-                            # We are currently HIDDEN and updating the line counter
-                            match = re.search(r'</(write_file|file|write)>', display_state['buffer'], re.IGNORECASE)
-                            if match:
-                                # Finished writing file!
-                                file_chunk = display_state['buffer'][:match.start()]
-                                display_state['lines'] += file_chunk.count('\n')
-                                
-                                sys.stdout.write(f"\r\033[K  └─> \033[92m✅ Saved {display_state['lines']} lines.\033[0m\n")
-                                sys.stdout.flush()
-                                
-                                display_state['in_tag'] = False
-                                display_state['buffer'] = display_state['buffer'][match.end():]
+                                    display_state['in_tag'] = True
+                                    display_state['filename'] = match.group(2)
+                                    display_state['lines'] = 0
+                                    sys.stdout.write(f"\n\033[96m⚙️  Writing {display_state['filename']}...\033[0m\n")
+                                    display_state['buffer'] = display_state['buffer'][match.end():]
+                                else:
+                                    if len(display_state['buffer']) > 20:
+                                        sys.stdout.write(display_state['buffer'][:-20])
+                                        sys.stdout.flush()
+                                        display_state['buffer'] = display_state['buffer'][-20:]
+                                    break
                             else:
-                                # Still writing. Update the counter.
-                                if len(display_state['buffer']) > 20:
-                                    file_chunk = display_state['buffer'][:-20]
+                                match = re.search(r'</(write_file|file|write)>', display_state['buffer'], re.IGNORECASE)
+                                if match:
+                                    file_chunk = display_state['buffer'][:match.start()]
                                     display_state['lines'] += file_chunk.count('\n')
-                                    display_state['buffer'] = display_state['buffer'][-20:]
-                                    
-                                    sys.stdout.write(f"\r\033[K  └─> ✍️  Generating... {display_state['lines']} lines")
+                                    sys.stdout.write(f"\r\033[K  └─> \033[92m✅ Saved {display_state['lines']} lines.\033[0m\n")
                                     sys.stdout.flush()
-                                break
-                                
-                elif kind == "error":
-                    console.print(f"\n[red]Error: {content}[/red]")
-                    break
+                                    display_state['in_tag'] = False
+                                    display_state['buffer'] = display_state['buffer'][match.end():]
+                                else:
+                                    if len(display_state['buffer']) > 20:
+                                        file_chunk = display_state['buffer'][:-20]
+                                        display_state['lines'] += file_chunk.count('\n')
+                                        display_state['buffer'] = display_state['buffer'][-20:]
+                                        sys.stdout.write(f"\r\033[K  └─> ✍️  Generating... {display_state['lines']} lines")
+                                        sys.stdout.flush()
+                                    break
+                                    
+                    elif kind == "error":
+                        console.print(f"\n[red]Error: {content}[/red]")
+                        break
+            except KeyboardInterrupt:
+                console.print("\n[bold yellow]Generation stopped! (Ctrl+C)[/bold yellow]")
+                break
+                
+            full_response += chunk_response
+            
+            # Check for Interruption
+            open_tags = list(re.finditer(r'<(write_file|file|write)\s+path=["\']([^"\']+)["\']\s*>', full_response, re.IGNORECASE))
+            close_tags = list(re.finditer(r'</(write_file|file|write)>', full_response, re.IGNORECASE))
+            
+            if len(open_tags) > len(close_tags):
+                continuation_count += 1
+                filename = open_tags[-1].group(2)
+                sys.stdout.write(f"\r\033[K  └─> \033[93m⚠️ Limit reached. Auto-continuing {filename}... ({continuation_count}/{max_continuations})\033[0m")
+                sys.stdout.flush()
+                
+                # Append context to push it forward
+                current_messages.append({"role": "assistant", "content": chunk_response})
+                current_messages.append({"role": "user", "content": f"CRITICAL: You hit the output limit while writing '{filename}'. Please continue writing the file content EXACTLY where you left off. DO NOT write any conversational text, DO NOT output a new <write_file> tag, and DO NOT use markdown like ```python. Just output the exact remaining raw characters of the code and finish with </write_file>."})
+            else:
+                break # Finished writing all files!
 
-            # Flush remaining safe buffer
-            if display_state['buffer'] and not display_state['in_tag']:
-                sys.stdout.write(display_state['buffer'])
-            elif display_state['in_tag']:
-                # Connection dropped while writing
-                sys.stdout.write(f"\r\033[K  └─> \033[93m⚠️ Interrupted at {display_state['lines']} lines.\033[0m\n")
-            sys.stdout.flush()
-            print()
-
-        except KeyboardInterrupt:
-            console.print("\n[bold yellow]Generation stopped! (Ctrl+C)[/bold yellow]")
-
+        # Flush remaining text
+        if display_state['buffer'] and not display_state['in_tag']:
+            sys.stdout.write(display_state['buffer'])
+        elif display_state['in_tag']:
+            sys.stdout.write(f"\r\033[K  └─> \033[93m⚠️ Interrupted at {display_state['lines']} lines.\033[0m\n")
+            full_response += "\n</write_file>"
+            
+        sys.stdout.flush()
+        print()
         console.print(Rule(style="dim magenta"))
 
-        # Save AI memory
+        # Save Memory & Execute Files
         mem_match = re.search(r'<memory>(.*?)</memory>', full_response, re.DOTALL | re.IGNORECASE)
         ai_memory = mem_match.group(1).strip() if mem_match else ""
 
-        # Auto-close tags if interrupted
-        if len(re.findall(r'<write_file', full_response, re.IGNORECASE)) > len(re.findall(r'</write_file>', full_response, re.IGNORECASE)):
-            full_response += "\n</write_file>"
-
-        # Actually write the files to your computer
         actions = extract_actions(full_response)
         if actions:
             console.print("[dim cyan]Executing changes...[/dim cyan]")
             for action in actions:
                 result = execute_action(action, folder_path)
-                if result:
-                    console.print(f"  [green]✔ {result}[/green]")
+                if result: console.print(f"  [green]✔ {result}[/green]")
             console.print()
 
         conversation_messages.append({"role": "assistant", "content": full_response})
 
 async def main():
     print_banner()
-
     while True:
         try:
             folder_raw = Prompt.ask("[bold cyan]Enter project folder path[/bold cyan]").strip().strip('"').strip("'")
             folder_path = str(Path(folder_raw).expanduser().resolve())
             if Path(folder_path).is_dir(): break
             console.print(f"[red]  X Not a valid directory[/red]")
-        except (KeyboardInterrupt, EOFError):
-            return
+        except (KeyboardInterrupt, EOFError): return
 
     console.print(f"\n[green]OK Folder:[/green][bold]{folder_path}[/bold]\n")
     await chat_loop(folder_path)
